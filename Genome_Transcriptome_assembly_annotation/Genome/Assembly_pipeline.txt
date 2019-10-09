@@ -1,0 +1,116 @@
+##Genome Assembly
+## This work was conducted on the qm server in the lab of Mark Blaxter at the University of Edinburgh 
+##October 2018
+##Work conducted by Alyssa Woronik with the assistance of Lewis Stevens
+##Raw sequencing reads can be found on the qm server @ /data/projects/caenorhabditis/raw/fitch_rnaseq/
+##They can also be found on the orange Lacie external drive that has a green tape label and says"Sequencing data Fitch Lab" Located in the Fitch Lab
+
+##This document has the command line scripts I ran on the qm server. I will only provide the example for the sample DF5010, but the same commands were run for all species
+
+
+#######Note for most of these shell scripts you will need to go in and edit the paths to the files.######
+
+##########################################
+#First run Skewer to trim adapters https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-15-182
+qsub -v PREFIX=DF5173-4,F=/data/projects/caenorhabditis/raw/11400_Blaxter_Mark/raw_data/20180928/DF5173/180907_E00306_0370_AHMNKHCCXY_4_11400BM0005L01_1.fastq.gz,R=/data/projects/caenorhabditis/raw/11400_Blaxter_Mark/raw_data/20180928/DF5173/180907_E00306_0370_AHMNKHCCXY_4_11400BM0005L01_2.fastq.gz -pe smp 30 skewer.sh
+
+##########################################
+#Run Fastqc to asses quality of the sequencing reads
+qsub -v PREFIX=DF5173-4,F=/data/projects/caenorhabditis/analyses/alyssa/DF5174-4-trimmed-pair1.fastq.gz,R=/data/projects/caenorhabditis/analyses/alyssa/DF5174-4-trimmed-pair2.fastq.gz -pe smp 2 fastqc.sh
+
+##########################################
+#Run multiQC to see all fastqc reports together
+#Install conda to get MultiQc
+
+export PATH=/ceph/software/conda/bin/:$PATH
+source activate main_env
+
+#^^this is a pre cooked enviroment by Blaxter Lab
+#Within the directory where the fastqc files are run
+
+multiqc .
+
+##########################################
+#Run spades to assembly the genome
+qsub -v PREFIX=DF5173_spades,F1=`readlink -f DF5173-4-trimmed-pair1.fastq.gz`,R1=`readlink -f DF5173-4-trimmed-pair2.fastq.gz`,F2=`readlink -f DF5173-5-trimmed-pair1.fastq.gz`,R2=`readlink -f DF5173-5-trimmed-pair2.fastq.gz`,F3=`readlink -f DF5173-6-trimmed-pair1.fastq.gz`,R3=`readlink -f DF5173-6-trimmed-pair2.fastq.gz` -l h=bigfoot -pe smp64 32 spades.sh
+
+##########################################
+#Assess genome quality
+scaffold_stats.pl -f /data/projects/caenorhabditis/analyses/alyssa/DF5173_spades/scaffolds.fasta
+
+##########################################
+#Because for these particular assemblies they are highly fragmented we will subset the assembly for scaffolds > 200bp. This will speed the computation downstream
+qsub -v PREFIX=DF5173 -pe smp 30 fastaqual_select.sh
+
+##########################################
+#Next we run a Blaxter lab program called Blobtools https://blobtools.readme.io/docs
+#The idea is to see how much of the assembled genome is actually worm scaffolds. The first step is to run a nucleotide blast, then you run a protein blast using a program called diamond
+qsub -v FASTA=/data/projects/caenorhabditis/analyses/alyssa/DF5173_spades_scaf_greater_200.fasta -pe smp64 32 blast.sh
+qsub -v FASTA=/data/projects/caenorhabditis/analyses/alyssa/DF5173_spades_scaf_greater_200.fasta -pe smp64 32 diamond.sh
+
+#Sometimes it gets hung up and you may need to run this seperately
+/ceph/software/blobtools/blobtools taxify \
+-f DF5173_spades_scaf_greater_200.fasta.diamond \
+-m /ceph/software/blast_db/diamond/uniprot_2017_12/uniprot_ref_proteomes.taxids \
+-s 0 \
+-t 2
+
+qsub -v SCAFFOLD=/data/projects/caenorhabditis/analyses/alyssa/DF5025.spades2_scaf_greater_200.fasta,BLASTN=/data/projects/caenorhabditis/analyses/alyssa/DF5025.spades2_scaf_greater_200.fasta.blastn,DIAMOND=/data/projects/caenorhabditis/analyses/alyssa/DF5025.spades2_scaf_greater_200.fasta.diamond.taxified.out,OUTPUT=DF5025.spades2_scaf_greater_200 -pe smp64 64 blob.sh
+
+##########################################
+#Next I concatenated the reads
+cat DF5173-4-trimmed-pair1.fastq.gz DF5173-5-trimmed-pair1.fastq.gz DF5173-6-trimmed-pair1.fastq.gz > DF5173_cat_trimmed-pair1.fastq.gz
+cat DF5173-4-trimmed-pair2.fastq.gz DF5173-5-trimmed-pair2.fastq.gz DF5173-6-trimmed-pair2.fastq.gz > DF5173_cat_trimmed-pair2.fastq.gz
+
+##########################################
+#A fair amount of the reads tend to come from e.coli since we are growing the worms on e coli. Thus to improve the assemble we map reads to the ecoli genome and remove those reads then re-assemble. You could also do this right from the get-go and not waste time doing the first round of assembly and blob tools check
+
+qsub -v PREFIX=DF5173,F=/data/projects/caenorhabditis/analyses/alyssa/DF5173_cat_trimmed-pair1.fastq.gz,R=/data/projects/caenorhabditis/analyses/alyssa/DF5173_cat_trimmed-pair2.fastq.gz -pe smp64 64 bowtie.sh
+
+#run bamfilter
+
+#https://blobtools.readme.io/docs/bamfilter
+#make the exclude file
+#grep '>' E_coli_strains.fna > ecoli_names
+#^^ the ecoli_names file can be found in this repo, but the genome is to big to include
+
+qsub -v PREFIX=DF5173 -pe smp64 32 bamfilter.sh
+
+#The output is an interleaved Fastq file
+
+#*.InIn.fq both reads in read pair mapping to included sequences
+#*.InUn.fq one read mapping to an included sequence and the other being unmapped
+#*.ExIn.fq one read mapping to an included sequence and the other mapping to an excluded sequence
+#*.UnUn.fq read pairs where neither read maps to the assembly. This file is only written if --include_unmapped is provided
+
+#dont supply either a exclude or include file
+
+deinterleave_fastq.sh < SB303.SB303.bam.UnUn.fq f.fastq r.fastq
+	
+mv f.fastq SB303_ecoli_excl_1.fastq
+mv r.fastq SB303_ecoli_excl_2.fastq
+
+Take one InUn files as this accounts for the reads that are not mapping to e coli and reads where one maps to ecoli but the other does not this could be a true situation of horizontal gene transer and potentially really part of the genome so you dont want to get rid of it 
+InUn.fq read mapping to an included sequence and the other being unmapped
+
+You need to cat the InUn and UnUn
+
+#Cat the InUn and UnUn and the deinterleave
+qsub -v PREFIX=DF5173 -pe smp64 32 cat_and_deinterleave.sh
+
+#you migh run into some bugs with this bash script, if so run it seperately
+deinterleave_fastq.sh < interleaved.fastq f.fastq r.fastq
+
+
+##Now that we have removed reads that map as a proper pair to the ecoli genome we re run spades. Again we could have just straight away identified and removed e coli reads, but the idea was to see how contaminated our library was
+
+qsub -v PREFIX=DF5173_spades2,F1=/data/projects/caenorhabditis/analyses/alyssa/DF5173.InUn_UnUn_f.fastq,R1=/data/projects/caenorhabditis/analyses/alyssa/DF5173.InUn_UnUn_r.fastq -pe smp64 64 spades_2.sh
+
+#again we subset contigs that are >200
+
+qsub -v PREFIX=DF5173 -pe smp 30 fastaqual_select2.sh
+
+
+
+
+
